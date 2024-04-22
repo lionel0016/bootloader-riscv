@@ -42,6 +42,9 @@ RV_TOP_DIR=${TOP_DIR:-$(get_rv_top)}
 RV_SCRIPTS_DIR=$RV_TOP_DIR/bootloader-riscv/scripts
 RV_OUTPUT_DIR=$RV_TOP_DIR/install/soc_$CHIP/"$CHIP_NUM"_chip
 
+RV_BOOTROM_SRC_DIR=$RV_TOP_DIR/bootrom
+RV_BOOTROM_BUILD_DIR=$RV_BOOTROM_SRC_DIR/build/$CHIP/$KERNEL_VARIANT
+
 RV_ZSBL_SRC_DIR=$RV_TOP_DIR/zsbl
 RV_ZSBL_BUILD_DIR=$RV_ZSBL_SRC_DIR/build/$CHIP/$KERNEL_VARIANT
 RV_SBI_SRC_DIR=$RV_TOP_DIR/opensbi
@@ -61,12 +64,16 @@ RV_UROOT_DIR=$RV_TOP_DIR/bootloader-riscv/u-root
 RV_LTP_SRC_DIR=$RV_TOP_DIR/bsp-solutions/ltp
 RV_LTP_OUTPUT_DIR=$RV_OUTPUT_DIR/ltp
 
+TPUV7_RUNTIME_DIR=$RV_TOP_DIR/tpuv7-runtime
+TPUV7_AP_DAEMON=$TPUV7_RUNTIME_DIR/build/asic/cdmlib/ap/daemon/cdm_daemon/cdm_daemon
+TPUV7_TP_DAEMON=$TPUV7_RUNTIME_DIR/build/asic/cdmlib/tp/daemon/tp_daemon
+
 RV_DISTRO_DIR=$RV_TOP_DIR/distro_riscv
 RV_UBUNTU_DISTRO=ubuntu
 RV_FEDORA_DISTRO=fedora
 RV_EULER_DISTRO=euler
 
-RV_UBUNTU_OFFICIAL_IMAGE=ubuntu-22.04.3-preinstalled-server-riscv64+unmatched.img
+RV_UBUNTU_OFFICIAL_IMAGE=ubuntu-22.04.4-preinstalled-server-riscv64+unmatched.img
 DOWNLOAD_RV_UBUNTU_OFFICIAL_IMAGE="wget https://cdimage.ubuntu.com/releases/22.04/release/$RV_UBUNTU_OFFICIAL_IMAGE.xz"
 UNCOMPRESS_RV_UBUNTU_OFFICIAL_IMAGE="unxz $RV_UBUNTU_OFFICIAL_IMAGE.xz"
 
@@ -103,6 +110,14 @@ else
 fi
 RISCV64_ELF_CROSS_COMPILE=$RV_ELF_GCC_INSTALL_DIR/bin/riscv64-unknown-elf-
 
+TP_IMAGES=(
+	tp_zsbl.bin
+	fw_dynamic.bin
+	tp_Image.bin
+	tp.dtb
+	tp_rootfs.cpio
+)
+
 #######################################################################
 # common function
 #######################################################################
@@ -131,6 +146,7 @@ function show_rv_functions()
 	echo "show_rv_functions     		-print all funtions "
 	echo ""
 	echo "build_rv_gcc			-build gcc from source"
+	echo "build_rv_bootrom			-build bootrom bin"
 	echo "build_rv_zsbl			-build zsbl bin"
 	echo "build_rv_sbi			-build sbi bin"
 	echo "build_rv_edk2			-build EDKII bin"
@@ -161,8 +177,12 @@ function show_rv_functions()
 	echo "build_rv_fedora			-build sophgo fedora image"
 	echo "build_rv_euler			-build sophgo euler image"
 	echo "build_rv_all			-build all bin and image(default: ubuntu)"
+	echo "build_ap_ramfs			-build tpuv7 cdm ap rootfs"
+	echo "build_tp_ramfs			-build tpuv7 cdm tp rootfs"
+	echo "build_tpuv7_runtime		-build tpuv7 runtime for sdk"
 	echo ""
 	echo "clean_rv_gcc			-clean gcc obj files"
+	echo "clean_rv_bootrom			-clean bootrom obj files"
 	echo "clean_rv_zsbl			-clean zsbl obj files"
 	echo "clean_rv_sbi			-clean sbi obj files"
 	echo "clean_rv_edk2			-clean EDKII obj files"
@@ -191,6 +211,7 @@ function show_rv_functions()
 	echo "clean_rv_ubuntu			-clean ubuntu image"
 	echo "clean_rv_fedora			-clean feodra image"
 	echo "clean_rv_all			-clean all bin and image(default: ubuntu)"
+	echo "clean_tpuv7_runtime		-clean tpuv7 runtime for sdk"
 }
 
 #######################################################################
@@ -251,6 +272,45 @@ function clean_rv_gcc()
 #######################################################################
 # build bin and image
 #######################################################################
+
+function build_rv_bootrom()
+{
+    local err
+
+    pushd $RV_BOOTROM_SRC_DIR
+    if [ $CHIP == 'mango' ]; then
+        make CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE O=$RV_BOOTROM_BUILD_DIR ARCH=riscv sg2042_defconfig
+    else
+        make CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE O=$RV_BOOTROM_BUILD_DIR ARCH=riscv ${CHIP}_defconfig
+    fi
+    err=$?
+    popd
+
+    if [ $err -ne 0 ]; then
+        echo "making bootrom config failed"
+        return $err
+        fi
+
+    pushd $RV_BOOTROM_BUILD_DIR
+    make -j$(nproc) CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE ARCH=riscv
+    err=$?
+    popd
+
+    if [ $err -ne 0 ]; then
+        echo "making bootrom failed"
+        return $err
+        fi
+
+    mkdir -p $RV_FIRMWARE_INSTALL_DIR
+
+    cp $RV_BOOTROM_BUILD_DIR/bootrom.bin $RV_FIRMWARE_INSTALL_DIR
+}
+
+function clean_rv_bootrom()
+{
+    rm -rf $RV_FIRMWARE_INSTALL_DIR/bootrom.bin
+    rm -rf $RV_BOOTROM_BUILD_DIR
+}
 
 function build_rv_zsbl()
 {
@@ -329,23 +389,41 @@ function build_rv_edk2()
 
 	make -C edk2/BaseTools
 
-	if [ "$CHIP_NUM" = "multi" ];then
-		TARGET=DEBUG
-		build -a RISCV64 -t GCC5 -b $TARGET -p Platform/Sophgo/SG2042_EVB_Board/SG2042.dsc
+	if [ $CHIP = 'mango' ]; then
+		if [ "$CHIP_NUM" = "multi" ];then
+			TARGET=DEBUG
+			build -a RISCV64 -t GCC5 -b $TARGET -p Platform/Sophgo/SG2042_EVB_Board/SG2042.dsc
+		else
+			TARGET=RELEASE
+			build -a RISCV64 -t GCC5 -b $TARGET -D X64EMU_ENABLE -p Platform/Sophgo/SG2042_EVB_Board/SG2042.dsc
+		fi
+
+		mkdir -p $RV_FIRMWARE_INSTALL_DIR
+
+		cp $RV_EDKII_SRC_DIR/Build/SG2042_EVB/$TARGET\_GCC5/FV/SG2042.fd $RV_FIRMWARE_INSTALL_DIR
 	else
-		TARGET=RELEASE
-		build -a RISCV64 -t GCC5 -b $TARGET -D X64EMU_ENABLE -p Platform/Sophgo/SG2042_EVB_Board/SG2042.dsc
+		pushd edk2-platforms
+		git checkout devel-${CHIP}
+		popd
+
+		TARGET=DEBUG
+		build -a RISCV64 -t GCC5 -b $TARGET -p Platform/Sophgo/${CHIP^^}Pkg/${CHIP^^}.dsc
+
+		mkdir -p $RV_FIRMWARE_INSTALL_DIR
+
+		cp $RV_EDKII_SRC_DIR/Build/${CHIP^^}/$TARGET\_GCC5/FV/${CHIP^^}.fd $RV_FIRMWARE_INSTALL_DIR
 	fi
+
 	popd
-
-	mkdir -p $RV_FIRMWARE_INSTALL_DIR
-
-	cp $RV_EDKII_SRC_DIR/Build/SG2042_EVB/$TARGET\_GCC5/FV/SG2042.fd $RV_FIRMWARE_INSTALL_DIR
 }
 
 function clean_rv_edk2()
 {
-	rm -rf $RV_FIRMWARE_INSTALL_DIR/SG2042.fd
+	if [ $CHIP = 'mango' ]; then
+		rm -rf $RV_FIRMWARE_INSTALL_DIR/SG2042.fd
+	else
+		rm -rf $RV_FIRMWARE_INSTALL_DIR/${CHIP^^}.fd
+	fi
 
 	pushd $RV_EDKII_SRC_DIR
 	rm -rf Build
@@ -606,6 +684,8 @@ function clean_rv_ubuntu_kernel()
 function build_rv_fedora_kernel()
 {
 	local RV_KERNEL_CONFIG=${VENDOR}_${CHIP}_fedora_defconfig
+	local KERNELRELEASE
+	local RPMBUILD_DIR
 	local err
 
 	pushd $RV_KERNEL_SRC_DIR
@@ -630,6 +710,13 @@ cat >> ~/.rpmmacros << "EOT"
 %_build_name_fmt        %%{ARCH}/%%{NAME}-%%{VERSION}.%%{ARCH}.rpm
 EOT
 
+	KERNELRELEASE=$(make ARCH=riscv LOCALVERSION="" kernelrelease)
+	if [[ ${KERNELRELEASE:0:3} == "6.1" ]]; then
+		RPMBUILD_DIR=$HOME/rpmbuild
+	else
+		RPMBUILD_DIR=$RV_KERNEL_SRC_DIR/rpmbuild
+	fi
+
 	make -j$(nproc) ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE LOCALVERSION="" rpm-pkg
 	ret=$?
 	rm ~/.rpmmacros
@@ -639,8 +726,8 @@ EOT
 	if [ $ret -ne 0 ]; then
 		echo "making rpm package failed"
 		make ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE distclean
-		rm kernel-[0-9]*.tar.gz
-		rm -rf $HOME/rpmbuild
+		rm *.tar.gz
+		rm -rf $RPMBUILD_DIR
 		popd
 		return $ret
 	fi
@@ -651,16 +738,26 @@ EOT
 		rm -f $RV_RPM_INSTALL_DIR/kernel-*.rpm
 	fi
 
-	cp $HOME/rpmbuild/RPMS/riscv64/*.rpm $RV_RPM_INSTALL_DIR/
+	cp $RPMBUILD_DIR/RPMS/riscv64/*.rpm $RV_RPM_INSTALL_DIR/
 	make ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE distclean
-	rm kernel-[0-9]*.tar.gz
-	rm -rf $HOME/rpmbuild
+	rm *.tar.gz
+	rm -rf $RPMBUILD_DIR
 	popd
+}
+
+function clean_rv_fedora_kernel()
+{
+	pushd $RV_KERNEL_SRC_DIR
+	make distclean
+	popd
+	rm -f $RV_RPM_INSTALL_DIR/kernel-*.rpm
 }
 
 function build_rv_euler_kernel()
 {
-	local RV_KERNEL_CONFIG=${VENDOR}_${CHIP}_euler_defconfig
+	local RV_KERNEL_CONFIG=${VENDOR}_${CHIP}_openeuler_defconfig
+	local KERNELRELEASE
+	local RPMBUILD_DIR
 	local err
 
 	pushd $RV_KERNEL_SRC_DIR
@@ -685,6 +782,13 @@ cat >> ~/.rpmmacros << "EOT"
 %_build_name_fmt        %%{ARCH}/%%{NAME}-%%{VERSION}.%%{ARCH}.rpm
 EOT
 
+	KERNELRELEASE=$(make ARCH=riscv LOCALVERSION="" kernelrelease)
+	if [[ ${KERNELRELEASE:0:3} == "6.1" ]]; then
+		RPMBUILD_DIR=$HOME/rpmbuild
+	else
+		RPMBUILD_DIR=$RV_KERNEL_SRC_DIR/rpmbuild
+	fi
+
 	make -j$(nproc) ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE LOCALVERSION="" rpm-pkg
 	ret=$?
 	rm ~/.rpmmacros
@@ -694,8 +798,8 @@ EOT
 	if [ $ret -ne 0 ]; then
 		echo "making rpm package failed"
 		make ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE distclean
-		rm kernel-[0-9]*.tar.gz
-		rm -rf $HOME/rpmbuild
+		rm *.tar.gz
+		rm -rf $RPMBUILD_DIR
 		popd
 		return $ret
 	fi
@@ -706,10 +810,10 @@ EOT
 		rm -f $RV_RPM_INSTALL_DIR/kernel-*.rpm
 	fi
 
-	cp $HOME/rpmbuild/RPMS/riscv64/*.rpm $RV_RPM_INSTALL_DIR/
+	cp $RPMBUILD_DIR/RPMS/riscv64/*.rpm $RV_RPM_INSTALL_DIR/
 	make ARCH=riscv CROSS_COMPILE=$RISCV64_LINUX_CROSS_COMPILE distclean
-	rm kernel-[0-9]*.tar.gz
-	rm -rf $HOME/rpmbuild
+	rm *.tar.gz
+	rm -rf $RPMBUILD_DIR
 	popd
 }
 
@@ -721,12 +825,149 @@ function clean_rv_euler_kernel()
 	rm -f $RV_RPM_INSTALL_DIR/kernel-*.rpm
 }
 
-function clean_rv_fedora_kernel()
+
+function build_tp_ramfs()
 {
-	pushd $RV_KERNEL_SRC_DIR
-	make distclean
+	if [ ! -d $RV_BUILDROOT_DIR/overlay/tp ]; then
+		mkdir -p $RV_BUILDROOT_DIR/overlay/tp
+	fi
+
+	# copy tp daemon
+	if [ -f $TPUV7_TP_DAEMON ]; then
+		cp $TPUV7_TP_DAEMON $RV_BUILDROOT_DIR/overlay/tp/
+	else
+		echo "no ap daemon found"
+	fi
+
+	# copy other non-generated files
+	cp $TPUV7_RUNTIME_DIR/cdmlib/overlay/tp/* $RV_BUILDROOT_DIR/overlay/tp/
+
+	pushd $RV_BUILDROOT_DIR
+	make sg2260_tp_defconfig
+	err=$?
 	popd
-	rm -f $RV_RPM_INSTALL_DIR/kernel-*.rpm
+
+	if [ $err -ne 0 ]; then
+	    echo 'config buildroot failed'
+	    return $err
+	fi
+
+	pushd $RV_BUILDROOT_DIR
+	make -j$(nproc)
+	err=$?
+	popd
+
+	if [ $err -ne 0 ]; then
+	    echo 'build buildroot failed'
+	    return $err
+	fi
+
+	cp $RV_BUILDROOT_DIR/output/images/rootfs.cpio $RV_FIRMWARE_INSTALL_DIR/tp_rootfs.cpio
+
+	# delete tp daemon
+	rm $RV_BUILDROOT_DIR/output/target/tp_daemon
+
+	# delete other non-generated files
+	pushd $RV_BUILDROOT_DIR/overlay/tp/
+	TP_OVERLAY_FILE=$(find ./)
+	popd
+
+	pushd $RV_BUILDROOT_DIR/output/target/
+	for i in ${TP_OVERLAY_FILE}; do
+		if [ -f $i ]; then
+			echo "dele $i"
+			rm $i
+		fi
+	done
+	popd
+}
+
+function clean_tp_ramfs()
+{
+	if [ -d $RV_BUILDROOT_DIR/overlay ]; then
+		rm -rf $RV_BUILDROOT_DIR/overlay
+	fi
+}
+
+function build_ap_ramfs()
+{
+	if [ ! -d $RV_BUILDROOT_DIR/overlay/ap ]; then
+		mkdir -p $RV_BUILDROOT_DIR/overlay/ap
+	fi
+
+	# copy ap daemon
+	if [ -f $TPUV7_AP_DAEMON ]; then
+		cp $TPUV7_AP_DAEMON $RV_BUILDROOT_DIR/overlay/ap/
+	else
+		echo "no ap daemon found"
+	fi
+
+	# copy tp firmware file
+	mkdir -p $RV_BUILDROOT_DIR/overlay/ap/lib/firmware/
+	for i in ${TP_IMAGES[@]}; do
+		if [ -f $RV_FIRMWARE_INSTALL_DIR/$i ]; then
+			cp $RV_FIRMWARE_INSTALL_DIR/$i $RV_BUILDROOT_DIR/overlay/ap/lib/firmware/
+		else
+			echo "no $RV_FIRMWARE_INSTALL_DIR/$i found"
+		fi
+	done
+
+	# copy other non-generated files
+	cp $TPUV7_RUNTIME_DIR/cdmlib/overlay/ap/* $RV_BUILDROOT_DIR/overlay/ap/
+
+	# package rootfs
+	pushd $RV_BUILDROOT_DIR
+	make sg2260_ap_defconfig
+	err=$?
+	popd
+
+	if [ $err -ne 0 ]; then
+	    echo 'config buildroot failed'
+	    return $err
+	fi
+
+	pushd $RV_BUILDROOT_DIR
+	make -j$(nproc)
+	err=$?
+	popd
+
+	if [ $err -ne 0 ]; then
+	    echo 'build buildroot failed'
+	    return $err
+	fi
+
+	cp $RV_BUILDROOT_DIR/output/images/rootfs.cpio $RV_FIRMWARE_INSTALL_DIR/ap_rootfs.cpio
+
+	# delete ap daemon
+	if [ -f $RV_BUILDROOT_DIR/output/target/cdm_daemon ]; then
+		rm $RV_BUILDROOT_DIR/output/target/cdm_daemon
+	fi
+
+	# delete tp firmware
+	if [ -d $RV_BUILDROOT_DIR/output/target/lib/firmware ]; then
+		rm -r $RV_BUILDROOT_DIR/output/target/lib/firmware
+	fi
+
+	# delete other non-generated files
+	pushd $RV_BUILDROOT_DIR/overlay/ap/
+	AP_OVERLAY_FILE=$(find ./)
+	popd
+
+	pushd $RV_BUILDROOT_DIR/output/target/
+	for i in ${AP_OVERLAY_FILE}; do
+		if [ -f $i ]; then
+			echo "dele $i"
+			rm $i
+		fi
+	done
+	popd
+}
+
+function clean_ap_ramfs()
+{
+	if [ -d $RV_BUILDROOT_DIR/overlay ]; then
+		rm -rf $RV_BUILDROOT_DIR/overlay
+	fi
 }
 
 function build_rv_ramfs()
@@ -1342,15 +1583,14 @@ function build_rv_firmware_bin()
 
 	rm -f firmware*.bin
 	cp $RV_FIRMWARE/fip.bin  ./
-	dtb_group=$(ls *.dtb | awk '{print ""$1" "$1" 0x020000000 "}')
+	dtb_group=$(ls *.dtb | awk '{print ""$1" "$1" 0x601000 0x020000000 "}')
 
 	./gen_spi_flash $dtb_group \
-			fw_dynamic.bin fw_dynamic.bin 0x00000000 \
-			riscv64_Image riscv64_Image 0x02000000 \
-			initrd.img initrd.img 0x30000000 \
-			zsbl.bin zsbl.bin 0x40000000	\
-			SG2042.fd SG2042.fd 0x02000000
-		#	uboot.bin uboot.bin 0x02000000
+			fw_dynamic.bin fw_dynamic.bin 0x660000 0x00000000 \
+			riscv64_Image riscv64_Image 0x6b0000 0x02000000 \
+			SG2042.fd SG2042.fd 0x02000000 0x02000000 \
+			zsbl.bin zsbl.bin 0x2a00000 0x40000000 \
+			initrd.img initrd.img 0x2b00000 0x30000000
 
 	mv spi_flash.bin firmware-$version.bin
 	rm -f gen_spi_flash
@@ -1543,6 +1783,28 @@ function clean_rv_all()
 {
 	clean_rv_firmware_bin
 	clean_rv_ubuntu
+}
+
+function build_tpuv7_runtime()
+{
+	mkdir -p $TPUV7_RUNTIME_DIR/build/asic
+	pushd $TPUV7_RUNTIME_DIR/build/asic
+	cmake -DCMAKE_INSTALL_PREFIX=$PWD/../install  -DUSING_CMODEL=OFF ../..
+	make -j$(nproc)
+        popd
+
+	mkdir -p $TPUV7_RUNTIME_DIR/build/emulator
+	pushd $TPUV7_RUNTIME_DIR/build/emulator
+	cmake -DCMAKE_INSTALL_PREFIX=$PWD/../install  -DUSING_CMODEL=ON ../..
+	make -j$(nproc)
+        popd
+}
+
+function clean_tpuv7_runtime()
+{
+	if [ -d $TPUV7_RUNTIME_DIR/build]; then
+		rm $TPUV7_RUNTIME_DIR/build
+	fi
 }
 
 # include top mcu environment
